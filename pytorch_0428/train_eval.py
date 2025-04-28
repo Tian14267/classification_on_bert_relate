@@ -112,7 +112,7 @@ def evaluate(config, model, data_iter, test=False):
     predict_all = np.array([], dtype=int)
     labels_all = np.array([], dtype=int)
     with torch.no_grad():
-        for texts, labels in tqdm(data_iter):
+        for texts, labels in tqdm(data_iter,desc="Eval "):
             outputs = model(texts)
             loss = F.cross_entropy(outputs, labels)
             loss_total += loss
