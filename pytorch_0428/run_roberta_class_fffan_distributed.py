@@ -292,12 +292,12 @@ def evaluate(dev_loader,model,local_rank, args):
     return acc, loss_total / len(dev_loader)
 
 
-def train(train_loader, dev_loader, model,global_step,
+def train(train_loader, dev_loader, model,global_step,all_save_model_list,
           optimizer, local_rank, args,
           epoch,best_model_info,scheduler):
     # switch to train mode
     model.train()
-    all_save_model_list = []
+    #all_save_model_list = []
     for step, batch in enumerate(tqdm(train_loader, desc="# Train", ascii=True)):
         #####
         batch = tuple(t.cuda(local_rank, non_blocking=True) for t in batch)
@@ -382,10 +382,11 @@ def train(train_loader, dev_loader, model,global_step,
         #"""
     if local_rank == 0:
         ######  复制模型
-        model_path_info = "/".join(all_save_model_list[-1].split("/")[:-1])+"/"+WEIGHTS_NAME
-        print(all_save_model_list[-1])
-        print(model_path_info)
-        shutil.copyfile(all_save_model_list[-1], model_path_info)
+        if all_save_model_list:
+            model_path_info = "/".join(all_save_model_list[-1].split("/")[:-1])+"/"+WEIGHTS_NAME
+            print(all_save_model_list[-1])
+            print(model_path_info)
+            shutil.copyfile(all_save_model_list[-1], model_path_info)
     return global_step
 
 def main_worker(local_rank, nprocs, args):
@@ -487,17 +488,18 @@ def main_worker(local_rank, nprocs, args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     # 定义 ReduceLROnPlateau 调度器，当验证集损失在 5 个 epoch 内没有改善时，学习率乘以 0.1
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
     ##############################################
     cudnn.benchmark = True
 
     global_step = 0
+    all_save_model_list = []
     best_model_info = {"dev_best_acc":0.0,"best_model_step":""}
     for one_epoch in range(int(args.num_train_epochs)):
         train_sampler.set_epoch(one_epoch)
 
         # train for one epoch
-        global_step = train(train_loader, dev_loader, model, global_step, optimizer, local_rank,
+        global_step = train(train_loader, dev_loader, model, global_step,all_save_model_list, optimizer, local_rank,
               args, one_epoch,best_model_info,scheduler)
 
     ######   测试
