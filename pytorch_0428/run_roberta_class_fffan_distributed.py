@@ -8,9 +8,11 @@
 from __future__ import absolute_import, division, print_function
 
 import os
+import time
 # os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import argparse
 import logging
+import shutil
 import numpy as np
 import torch.nn as nn
 import torch.distributed as dist
@@ -23,7 +25,9 @@ from torch.nn import CrossEntropyLoss
 import collections
 from sklearn import metrics
 import torch.nn.functional as F
-from transformers import RobertaModel, BertTokenizer
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from transformers import RobertaModel, BertTokenizer,RobertaTokenizer
+
 
 
 
@@ -31,7 +35,6 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 CONFIG_NAME = "config.json"
 WEIGHTS_NAME = "pytorch_model.bin"
@@ -124,7 +127,9 @@ class PregeneratedDataset(object):
             self.label_ids[item].clone().detach()
         )
 
-
+def get_time():
+    current_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    return current_time
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -175,7 +180,7 @@ def get_parser():
     parser.add_argument("--eval_batch_size",
                         default=8, type=int, help="Total batch size for eval.")
     parser.add_argument("--learning_rate",
-                        default=5e-5,
+                        default=1e-5,
                         type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument('--weight_decay',
@@ -287,9 +292,9 @@ def evaluate(dev_loader,model,local_rank, args):
     return acc, loss_total / len(dev_loader)
 
 
-def train(train_loader, dev_loader, test_loader, model,
+def train(train_loader, dev_loader, model,global_step,
           optimizer, local_rank, args,
-          global_step,epoch,dev_best_loss):
+          epoch,best_model_info,scheduler):
     # switch to train mode
     model.train()
     all_save_model_list = []
@@ -321,6 +326,8 @@ def train(train_loader, dev_loader, test_loader, model,
         model.zero_grad()  ###  把模型里所有可训练参数的梯度清零。
         global_step += 1
 
+        lr_now = optimizer.param_groups[0]["lr"]
+
         #"""
         if (global_step + 1) % args.eval_step == 0 and local_rank == 0:
             train_labels = label_ids.data.cpu().numpy()
@@ -329,8 +336,11 @@ def train(train_loader, dev_loader, test_loader, model,
 
             ######   eval
             dev_acc, dev_loss = evaluate(dev_loader, model, local_rank, args)
-            if dev_loss < dev_best_loss:
-                dev_best_loss = dev_loss
+            # 更新学习率
+            scheduler.step(dev_loss)
+            if dev_acc > best_model_info["dev_best_acc"]:
+                best_model_info["dev_best_acc"] = dev_acc
+                best_model_info["best_model_step"] = global_step
                 #save_path_in_epoch = os.path.join(config.save_path,
                 #                                  config.model_name + "_pytorch_model_" + str(epoch) + ".bin")
                 # print(save_path_in_epoch)
@@ -339,34 +349,44 @@ def train(train_loader, dev_loader, test_loader, model,
                 last_improve = global_step
             else:
                 improve = ''
-
-            msg = 'Iter: {0:>6},  Train Loss: {1:>5.2},  Train Acc: {2:>6.2%},  Val Loss: {3:>5.2}, Val Acc: {4:>6.2%}   {5}'
-            logger.info(msg.format(global_step, loss.item(), train_acc, dev_loss, dev_acc,  improve))
+            time_now = get_time()
+            msg = ('{0} Epoch:{1} Iter: {2:>6},  Train Loss: {3:>5.2},  Train Acc: {4:>6.2%}, LR:{5}  Val Loss: {6:>5.2}, '
+                   'Val Acc: {7:>6.2%}   {8}  \n').format(str(time_now),epoch,global_step, loss.item(),
+                           train_acc,lr_now,dev_loss, dev_acc,  improve
+                   )
+            logger.info(msg)
 
             output_eval_file = os.path.join(args.output_dir, "log.txt")
             with open(output_eval_file, "a") as writer:
-                writer.write(msg.format(global_step, loss.item(), train_acc, dev_loss, dev_acc, improve))
-                logger.info("***** Eval results *****")
-                writer.write("***** Eval results *****  ")
+                writer.write(msg)
+                logger.info("***** Eval results *****\n")
+                writer.write("***** Eval results *****  \n")
                 writer.write("Epoch = %s\n" % (str(epoch)))
                 writer.write("global_step = %s\n" % (str(global_step)))
                 for name,value in zip(("Eval_Acc","Eval_Loss"),(dev_acc,dev_loss)):
                     logger.info("  %s = %s", name, str(value))
                     writer.write("%s = %s\n" % (name, str(value)))
 
-            # 保存模型
+            # 保存最优模型
             ########################################################################
-            output_model_file = save_model(global_step, model, args.output_dir)
-            #####  保存的模型数量超过指定数量，删除模型  #############
-            if len(all_save_model_list) == args.save_model_number:
-                os.system("rm -rf " + all_save_model_list[0])
-                print("####  删除模型：", all_save_model_list[0])
-                del all_save_model_list[0]
-            ######################################################
+            if improve:
+                output_model_file = save_model(global_step, model, args.output_dir)
+                #####  保存的模型数量超过指定数量，删除模型  #############
+                if len(all_save_model_list) == args.save_model_number:
+                    os.system("rm -rf " + all_save_model_list[0])
+                    print("####  删除模型：", all_save_model_list[0])
+                    del all_save_model_list[0]
+                ######################################################
 
-            all_save_model_list.append(output_model_file)
+                all_save_model_list.append(output_model_file)
         #"""
-
+    if local_rank == 0:
+        ######  复制模型
+        model_path_info = "/".join(all_save_model_list[-1].split("/")[:-1])+"/"+WEIGHTS_NAME
+        print(all_save_model_list[-1])
+        print(model_path_info)
+        shutil.copyfile(all_save_model_list[-1], model_path_info)
+    return global_step
 
 def main_worker(local_rank, nprocs, args):
     dist.init_process_group(backend='nccl')
@@ -398,6 +418,7 @@ def main_worker(local_rank, nprocs, args):
     ########    初始化模型
     model = Model(args)
     tokenizer = BertTokenizer.from_pretrained(args.model_path, do_lower_case=args.do_lower_case)
+    #tokenizer = RobertaTokenizer.from_pretrained(args.model_path, do_lower_case=args.do_lower_case)
     print("#######  local_rank: ", local_rank)
     torch.cuda.set_device(local_rank)
     model.cuda(local_rank)
@@ -419,7 +440,7 @@ def main_worker(local_rank, nprocs, args):
 
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=args.train_batch_size,
-                                               num_workers=2,
+                                               num_workers=4,
                                                pin_memory=True,
                                                sampler=train_sampler)
     #####  验证数据
@@ -465,24 +486,27 @@ def main_worker(local_rank, nprocs, args):
     #                     t_total=num_train_optimization_steps)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    # 定义 ReduceLROnPlateau 调度器，当验证集损失在 5 个 epoch 内没有改善时，学习率乘以 0.1
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
     ##############################################
     cudnn.benchmark = True
 
     global_step = 0
-    dev_best_loss = float('inf')
+    best_model_info = {"dev_best_acc":0.0,"best_model_step":""}
     for one_epoch in range(int(args.num_train_epochs)):
         train_sampler.set_epoch(one_epoch)
 
         # train for one epoch
-        train(train_loader, dev_loader, test_loader, model, optimizer, local_rank,
-              args, global_step,one_epoch,dev_best_loss)
+        global_step = train(train_loader, dev_loader, model, global_step, optimizer, local_rank,
+              args, one_epoch,best_model_info,scheduler)
 
     ######   测试
+    logger.info("####   开始测试。。。")
     test_acc, test_loss = evaluate(test_loader, model, local_rank, args)
     output_eval_file = os.path.join(args.output_dir, "log.txt")
     with open(output_eval_file, "a") as writer:
         logger.info("***** Test results *****")
-        writer.write("***** Test results *****  ")
+        writer.write("***** Test results *****  \n")
         for name, value in zip(("Test_Acc", "Test_Loss"), (test_acc, test_loss)):
             logger.info("  %s = %s", name, str(value))
             writer.write("%s = %s\n" % (name, str(value)))
@@ -491,7 +515,7 @@ def main_worker(local_rank, nprocs, args):
 def main():
     args = get_parser()
     if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+        os.makedirs(args.output_dir, exist_ok=True)
 
     args.nprocs = torch.cuda.device_count()
     print("###########    ", args.nprocs)
